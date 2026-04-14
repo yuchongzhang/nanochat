@@ -13,7 +13,7 @@ Notable features:
 """
 
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,38 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    laplacian_heads: int | list[int] | tuple[int, ...] = 0
+
+    def __post_init__(self):
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(f"n_embd={self.n_embd} must be divisible by n_head={self.n_head}")
+        if self.n_kv_head > self.n_head or self.n_head % self.n_kv_head != 0:
+            raise ValueError(f"Expected n_kv_head <= n_head and n_head % n_kv_head == 0, got {self.n_kv_head}, {self.n_head}")
+        self.window_pattern = self.window_pattern.upper()
+        if not self.window_pattern:
+            raise ValueError("window_pattern must be non-empty")
+        self.laplacian_heads = self._normalize_laplacian_heads(self.laplacian_heads)
+
+    def _normalize_laplacian_heads(self, spec):
+        if isinstance(spec, int):
+            counts = [spec] * self.n_layer
+        elif isinstance(spec, (list, tuple)):
+            counts = list(spec)
+            if len(counts) != self.n_layer:
+                raise ValueError(f"laplacian_heads list must have length n_layer={self.n_layer}, got {len(counts)}")
+        else:
+            raise TypeError(f"laplacian_heads must be int or list[int], got {type(spec).__name__}")
+        for count in counts:
+            if not isinstance(count, int):
+                raise TypeError(f"laplacian head counts must be ints, got {type(count).__name__}")
+            if count < 0 or count > self.n_head:
+                raise ValueError(f"laplacian head count must be in [0, {self.n_head}], got {count}")
+        return tuple(counts)
+
+    def to_dict(self):
+        data = {field.name: getattr(self, field.name) for field in fields(self)}
+        data["laplacian_heads"] = list(self.laplacian_heads)
+        return data
 
 
 def norm(x):
@@ -70,6 +102,8 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.n_laplacian_head = config.laplacian_heads[layer_idx]
+        self.n_vanilla_head = self.n_head - self.n_laplacian_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -119,6 +153,14 @@ class CausalSelfAttention(nn.Module):
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
+
+        if self.n_laplacian_head > 0:
+            if self.n_head != self.n_kv_head:
+                v_current = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+            else:
+                v_current = v
+            y_laplacian = v_current[:, :, self.n_vanilla_head:, :] - y[:, :, self.n_vanilla_head:, :]
+            y = torch.cat([y[:, :, :self.n_vanilla_head, :], y_laplacian], dim=2)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -237,7 +279,12 @@ class GPT(nn.Module):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
-
+        
+        # Smear/backout scalars and smear gate must be explicitly initialized 
+        torch.nn.init.zeros_(self.smear_lambda)
+        torch.nn.init.constant_(self.backout_lambda, 0.2)
+        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+        
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)

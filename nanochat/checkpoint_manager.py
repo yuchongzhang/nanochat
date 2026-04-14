@@ -8,7 +8,7 @@ import json
 import logging
 import torch
 
-from nanochat.common import get_base_dir
+from nanochat.artifacts import get_checkpoints_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
@@ -26,6 +26,9 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "laplacian_heads" not in model_config_kwargs:
+        model_config_kwargs["laplacian_heads"] = 0
+        log0("Patching missing laplacian_heads in model config to 0")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -92,10 +95,12 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = meta_data["model_config"]
+    model_config_kwargs = dict(meta_data["model_config"])
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
+    meta_data["model_config"] = model_config.to_dict()
+    meta_data.setdefault("model_tag", os.path.basename(checkpoint_dir))
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
@@ -126,10 +131,11 @@ def find_largest_model(checkpoints_dir):
         match = re.match(r"d(\d+)", model_tag)
         if match:
             model_depth = int(match.group(1))
-            candidates.append((model_depth, model_tag))
+            model_mtime = os.path.getmtime(os.path.join(checkpoints_dir, model_tag))
+            candidates.append((model_depth, model_mtime, model_tag))
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        candidates.sort(reverse=True)
+        return candidates[0][2]
     # 2) if that failed, take the most recently updated model:
     model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
     return model_tags[0]
@@ -159,27 +165,16 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    meta_data["model_tag"] = model_tag
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    checkpoints_dir = get_checkpoints_dir(source)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
 
 def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    checkpoints_dir = get_checkpoints_dir(source)
     if model_tag is None:
         model_tag = find_largest_model(checkpoints_dir)
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)

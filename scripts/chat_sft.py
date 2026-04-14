@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+from nanochat.artifacts import get_checkpoint_dir
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
@@ -42,6 +43,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--output-tag", type=str, default=None, help="model tag to save to (default: inherit loaded model tag)")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
@@ -94,6 +96,12 @@ if not HAS_FA3:
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+source_model_tag = meta["model_tag"]
+output_model_tag = args.output_tag if args.output_tag else source_model_tag
+user_config["source_model_tag"] = source_model_tag
+user_config["resolved_model_tag"] = output_model_tag
+print0(f"Loaded base model tag: {source_model_tag}")
+print0(f"Output model tag: {output_model_tag}")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -139,7 +147,7 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=source_model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
@@ -397,8 +405,7 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+        checkpoint_dir = get_checkpoint_dir("sft", output_model_tag, base_dir=base_dir)
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -407,15 +414,8 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": orig_model.config.to_dict(),
+                "model_tag": output_model_tag,
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
@@ -503,7 +503,7 @@ print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="SFT", data=[
+get_report(output_model_tag).log(section="SFT", data=[
     user_config, # CLI args
     { # stats about the training setup
         "Number of iterations": step,

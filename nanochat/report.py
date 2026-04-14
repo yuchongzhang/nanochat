@@ -4,13 +4,14 @@ Utilities for generating training report cards. More messy code than usual, will
 
 import os
 import re
-import shutil
 import subprocess
 import socket
 import datetime
 import platform
 import psutil
 import torch
+
+from nanochat.artifacts import get_report_dir
 
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
@@ -363,9 +364,6 @@ class Report:
                 out_file.write(f"Total wall clock time: {hours}h{minutes}m\n")
             else:
                 out_file.write("Total wall clock time: unknown\n")
-        # also cp the report.md file to current directory
-        print(f"Copying report.md to current directory for convenience")
-        shutil.copy(report_file, "report.md")
         return report_file
 
     def reset(self):
@@ -397,12 +395,14 @@ class DummyReport:
     def reset(self, *args, **kwargs):
         pass
 
-def get_report():
+def get_report(model_tag=None):
     # just for convenience, only rank 0 logs to report
-    from nanochat.common import get_base_dir, get_dist_info
+    from nanochat.common import get_dist_info
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp_rank == 0:
-        report_dir = os.path.join(get_base_dir(), "report")
+        if model_tag is None:
+            model_tag = os.environ.get("NANOCHAT_MODEL_TAG")
+        report_dir = get_report_dir(model_tag=model_tag)
         return Report(report_dir)
     else:
         return DummyReport()
@@ -411,8 +411,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate or reset nanochat training reports.")
     parser.add_argument("command", nargs="?", default="generate", choices=["generate", "reset"], help="Operation to perform (default: generate)")
+    parser.add_argument("--model-tag", type=str, default=None, help="Optional model tag for tag-scoped reports")
     args = parser.parse_args()
     if args.command == "generate":
-        get_report().generate()
+        get_report(args.model_tag).generate()
     elif args.command == "reset":
-        get_report().reset()
+        get_report(args.model_tag).reset()

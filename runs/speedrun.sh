@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
-# It is designed to run on a blank 8XH100 GPU node and takes approximately 3 hours to complete.
+# It is designed to run on a blank 4xH100 GPU node.
 
 # 1) Example launch (simplest):
 # bash runs/speedrun.sh
+# bash runs/speedrun.sh 2
+# bash runs/speedrun.sh 0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2
 # 2) Example launch in a screen session (because the run takes ~3 hours):
 # screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
@@ -12,8 +14,19 @@
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/home/yucz/links/scratch/nanochat_artifacts"
 mkdir -p $NANOCHAT_BASE_DIR
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+
+# Optional first arg: Laplacian head spec passed through to scripts.base_train.
+# Examples:
+#   0            => no Laplacian heads
+#   2            => two Laplacian heads in every layer
+#   0,2,2,0,...  => explicit per-layer schedule
+LAPLACIAN_HEADS="${1:-0}"
+LAPLACIAN_HEADS_TAG="${LAPLACIAN_HEADS//,/x}"
+RUN_TAG="d24_lap${LAPLACIAN_HEADS_TAG}"
+export NANOCHAT_MODEL_TAG="$RUN_TAG"
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
@@ -43,7 +56,7 @@ fi
 # During the course of the run, we will be writing markdown reports to the report/
 # directory in the base dir. This command clears it out and writes a header section
 # with a bunch of system info and a timestamp that marks the start of the run.
-python -m nanochat.report reset
+python -m nanochat.report reset --model-tag "$RUN_TAG"
 
 # -----------------------------------------------------------------------------
 # Tokenizer
@@ -70,9 +83,16 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -- \
+    --depth=24 \
+    --target-param-data-ratio=8 \
+    --device-batch-size=16 \
+    --fp8 \
+    --laplacian-heads="$LAPLACIAN_HEADS" \
+    --model-tag="$RUN_TAG" \
+    --run="$WANDB_RUN"
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_eval -- --device-batch-size=16 --model-tag="$RUN_TAG"
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
@@ -82,8 +102,8 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.chat_sft -- --device-batch-size=16 --model-tag="$RUN_TAG" --output-tag="$RUN_TAG" --run="$WANDB_RUN"
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.chat_eval -- -i sft -g "$RUN_TAG"
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
@@ -93,5 +113,5 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
 
 # -----------------------------------------------------------------------------
 # Generate the full report by putting together all the sections
-# report.md is the output and will be copied to current directory for convenience
-python -m nanochat.report generate
+# report.md is generated under the tag-scoped report directory
+python -m nanochat.report generate --model-tag "$RUN_TAG"

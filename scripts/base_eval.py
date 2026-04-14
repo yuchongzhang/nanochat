@@ -31,6 +31,7 @@ import tempfile
 import argparse
 import torch
 
+from nanochat.artifacts import get_base_eval_dir
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
 from nanochat.checkpoint_manager import load_model
@@ -210,6 +211,7 @@ def main():
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
         model_name = f"base_model (step {meta['step']})"
+        resolved_model_tag = meta["model_tag"]
         model_slug = f"base_model_{meta['step']:06d}"
 
     print0(f"Evaluating model: {model_name}")
@@ -284,8 +286,11 @@ def main():
 
         # Write CSV output
         if ddp_rank == 0:
-            base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            if is_hf_model:
+                output_dir = get_base_eval_dir()
+            else:
+                output_dir = get_base_eval_dir(resolved_model_tag)
+            output_csv_path = os.path.join(output_dir, f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
@@ -314,7 +319,8 @@ def main():
     if unconditioned_samples:
         report_data.append({f"unconditioned {i}": s for i, s in enumerate(unconditioned_samples)})
 
-    get_report().log(section="Base model evaluation", data=report_data)
+    report_tag = None if is_hf_model else meta["model_tag"]
+    get_report(report_tag).log(section="Base model evaluation", data=report_data)
 
     compute_cleanup()
 

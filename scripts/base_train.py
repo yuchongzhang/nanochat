@@ -18,16 +18,16 @@ import json
 import time
 import math
 import argparse
-from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
+from nanochat.artifacts import parse_laplacian_heads_spec, resolve_model_tag, get_checkpoint_dir
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -52,6 +52,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--laplacian-heads", type=parse_laplacian_heads_spec, default=0, help="number of Laplacian heads: int for all layers, or comma-separated per-layer list")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -136,7 +137,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, laplacian_heads=args.laplacian_heads,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -145,15 +146,16 @@ def build_model_meta(depth):
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
-model_config_kwargs = asdict(model_config)
+model_config_kwargs = model_config.to_dict()
+resolved_model_tag = resolve_model_tag(model_config, args.model_tag)
+user_config["resolved_model_tag"] = resolved_model_tag
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+print0(f"Resolved model tag: {resolved_model_tag}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+checkpoint_dir = get_checkpoint_dir("base", resolved_model_tag)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -484,6 +486,7 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
+                "model_tag": resolved_model_tag,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
@@ -601,7 +604,7 @@ if val_bpb is not None:
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Base model training", data=[
+get_report(resolved_model_tag).log(section="Base model training", data=[
     user_config, # CLI args
     { # stats about the training setup
         "Number of parameters": num_params,

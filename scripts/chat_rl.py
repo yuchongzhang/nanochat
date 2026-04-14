@@ -22,6 +22,7 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
+from nanochat.artifacts import get_checkpoint_dir
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
@@ -37,6 +38,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--output-tag", type=str, default=None, help="model tag to save to (default: inherit loaded model tag)")
 # Training horizon
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
 # Batch sizes / sampling
@@ -72,6 +74,12 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+source_model_tag = meta["model_tag"]
+output_model_tag = args.output_tag if args.output_tag else source_model_tag
+user_config["source_model_tag"] = source_model_tag
+user_config["resolved_model_tag"] = output_model_tag
+print0(f"Loaded SFT model tag: {source_model_tag}")
+print0(f"Output model tag: {output_model_tag}")
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -307,24 +315,23 @@ for step in range(num_steps):
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
-        depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        checkpoint_dir = get_checkpoint_dir("rl", output_model_tag, base_dir=base_dir)
         save_checkpoint(
             checkpoint_dir,
             step,
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
-                "model_config": model_config_kwargs,
+                "model_config": model.config.to_dict(),
+                "model_tag": output_model_tag,
+                "user_config": user_config,
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Chat RL", data=[
+get_report(output_model_tag).log(section="Chat RL", data=[
     user_config, # CLI args
 ])
 
