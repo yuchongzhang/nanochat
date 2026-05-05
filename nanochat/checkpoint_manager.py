@@ -29,18 +29,60 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "laplacian_heads" not in model_config_kwargs:
         model_config_kwargs["laplacian_heads"] = 0
         log0("Patching missing laplacian_heads in model config to 0")
+    if "use_ve" not in model_config_kwargs:
+        model_config_kwargs["use_ve"] = True
+        log0("Patching missing use_ve in model config to True")
+    if "use_resid_lambdas" not in model_config_kwargs:
+        model_config_kwargs["use_resid_lambdas"] = True
+        log0("Patching missing use_resid_lambdas in model config to True")
+    if "use_x0" not in model_config_kwargs:
+        model_config_kwargs["use_x0"] = True
+        log0("Patching missing use_x0 in model config to True")
+    if "use_smear" not in model_config_kwargs:
+        model_config_kwargs["use_smear"] = True
+        log0("Patching missing use_smear in model config to True")
+    if "use_backout" not in model_config_kwargs:
+        model_config_kwargs["use_backout"] = True
+        log0("Patching missing use_backout in model config to True")
+
+
+def _make_like_param(model_data, shape, fill_value):
+    sample = next((tensor for tensor in model_data.values() if torch.is_tensor(tensor) and tensor.is_floating_point()), None)
+    kwargs = {}
+    if sample is not None:
+        kwargs["device"] = sample.device
+        kwargs["dtype"] = sample.dtype
+    return torch.full(shape, fill_value, **kwargs)
+
+
+def _ensure_param_shape(model_data, key, shape, fill_value):
+    expected_shape = tuple(shape)
+    current = model_data.get(key)
+    if current is None:
+        model_data[key] = _make_like_param(model_data, expected_shape, fill_value)
+        log0(f"Patching missing {key} in model data to shape {expected_shape}")
+    elif tuple(current.shape) != expected_shape:
+        model_data[key] = _make_like_param(model_data, expected_shape, fill_value)
+        log0(f"Patching {key} in model data from shape {tuple(current.shape)} to {expected_shape}")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
     n_layer = model_config.n_layer
+    resid_size = n_layer if model_config.use_resid_lambdas else 0
+    x0_size = n_layer if model_config.use_x0 else 0
+    smear_size = 1 if model_config.use_smear else 0
+    backout_size = 1 if model_config.use_backout else 0
     # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
+    _ensure_param_shape(model_data, "resid_lambdas", (resid_size,), 1.0)
     # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
+    _ensure_param_shape(model_data, "x0_lambdas", (x0_size,), 0.0)
+    _ensure_param_shape(model_data, "smear_lambda", (smear_size,), 0.0)
+    _ensure_param_shape(model_data, "backout_lambda", (backout_size,), 0.2)
+    if model_config.use_smear:
+        _ensure_param_shape(model_data, "smear_gate.weight", (1, 24), 0.0)
+    elif "smear_gate.weight" in model_data:
+        model_data.pop("smear_gate.weight")
+        log0("Dropping smear_gate.weight from model data because use_smear is False")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:

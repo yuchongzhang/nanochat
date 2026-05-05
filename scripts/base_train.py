@@ -53,6 +53,11 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--laplacian-heads", type=parse_laplacian_heads_spec, default=0, help="number of Laplacian heads: int for all layers, or comma-separated per-layer list")
+parser.add_argument("--no-ve", action="store_true", help="disable value residuals / value embeddings")
+parser.add_argument("--no-resid-lambdas", action="store_true", help="disable residual lambda scaling and use standard residual connections")
+parser.add_argument("--no-x0", action="store_true", help="disable x0 residual additions")
+parser.add_argument("--no-smear", action="store_true", help="disable smear gate and smear residual mixing")
+parser.add_argument("--no-backout", action="store_true", help="disable backout residual subtraction")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -139,6 +144,11 @@ def build_model_meta(depth, laplacian_heads=None):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        use_ve=not args.no_ve,
+        use_resid_lambdas=not args.no_resid_lambdas,
+        use_x0=not args.no_x0,
+        use_smear=not args.no_smear,
+        use_backout=not args.no_backout,
         window_pattern=args.window_pattern, laplacian_heads=laplacian_heads,
     )
     with torch.device("meta"):

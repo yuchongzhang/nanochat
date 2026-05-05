@@ -48,6 +48,11 @@ def make_model_tag(config):
         f"-kv{config.n_kv_head}"
         f"-w{window_tag}"
         f"-lap{lap_tag}"
+        f"{'' if config.use_ve else '-nove'}"
+        f"{'' if config.use_resid_lambdas else '-stdresid'}"
+        f"{'' if config.use_x0 else '-nox0'}"
+        f"{'' if config.use_smear else '-nosmear'}"
+        f"{'' if config.use_backout else '-nobackout'}"
     )
 
 

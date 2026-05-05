@@ -14,7 +14,7 @@
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="/home/yucz/links/scratch/nanochat_artifacts"
+export NANOCHAT_BASE_DIR="/home/yucz/scratch/nanochat_artifacts"
 mkdir -p $NANOCHAT_BASE_DIR
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 
@@ -25,7 +25,9 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 #   0,2,2,0,...  => explicit per-layer schedule
 LAPLACIAN_HEADS="${1:-0}"
 LAPLACIAN_HEADS_TAG="${LAPLACIAN_HEADS//,/x}"
-RUN_TAG="d24_lap${LAPLACIAN_HEADS_TAG}"
+PARAM_DATA_RATIO=12
+DEPTH=24
+RUN_TAG="d${DEPTH}_lap${LAPLACIAN_HEADS_TAG}_true_vanilla_ratio${PARAM_DATA_RATIO}"
 export NANOCHAT_MODEL_TAG="$RUN_TAG"
 
 # -----------------------------------------------------------------------------
@@ -84,10 +86,16 @@ wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -- \
-    --depth=24 \
-    --target-param-data-ratio=8 \
+    --depth="$DEPTH" \
+    --target-param-data-ratio="$PARAM_DATA_RATIO" \
     --device-batch-size=16 \
-    --fp8 \
+    --window-pattern=L \
+    --no-ve \
+    --no-resid-lambdas \
+    --no-x0 \
+    --no-smear \
+    --no-backout \
+    --save-every=4000 \
     --laplacian-heads="$LAPLACIAN_HEADS" \
     --model-tag="$RUN_TAG" \
     --run="$WANDB_RUN"
