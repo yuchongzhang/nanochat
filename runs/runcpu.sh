@@ -26,6 +26,9 @@ python -m nanochat.dataset -n 8
 python -m scripts.tok_train --max-chars=2000000000
 python -m scripts.tok_eval
 
+# Pin an explicit model tag so every stage below loads exactly this run's checkpoint
+MODEL_TAG="${MODEL_TAG:-runcpu_d6}"
+
 # train a small 6 layer model
 # I tuned this run to complete in about 30 minutes on my MacBook Pro M3 Max.
 # To get better results, try increasing num_iterations, or get other ideas from your favorite LLM.
@@ -41,14 +44,16 @@ python -m scripts.base_train \
     --core-metric-every=-1 \
     --sample-every=100 \
     --num-iterations=5000 \
+    --model-tag=$MODEL_TAG \
     --run=$WANDB_RUN
-python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
+python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16 --model-tag=$MODEL_TAG
 
 # SFT (~10 minutes on my MacBook Pro M3 Max)
 python -m scripts.chat_sft \
     --eval-every=200 \
     --eval-tokens=524288 \
     --num-iterations=1500 \
+    --model-tag=$MODEL_TAG \
     --run=$WANDB_RUN
 
 # Chat with the model over CLI
