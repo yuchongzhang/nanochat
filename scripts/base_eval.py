@@ -28,6 +28,7 @@ import tempfile
 import argparse
 import torch
 
+from nanochat.artifacts import get_base_eval_dir
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
@@ -134,6 +135,7 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--seed', type=int, default=42, help='random seed for sampling during evaluation')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -145,11 +147,12 @@ def main():
 
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
     # Load model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
     sequence_len = meta["model_config"]["sequence_len"]
     token_bytes = get_token_bytes(device=device)
+    resolved_model_tag = meta["model_tag"]
     model_name = f"base_model (step {meta['step']})"
     model_slug = f"base_model_{meta['step']:06d}"
 
@@ -223,8 +226,8 @@ def main():
 
         # Write CSV output
         if ddp_rank == 0:
-            base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            # Tag-scoped so that two models that stop at the same step don't overwrite each other
+            output_csv_path = os.path.join(get_base_eval_dir(resolved_model_tag), f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")

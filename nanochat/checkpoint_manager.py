@@ -7,7 +7,7 @@ import json
 import logging
 import torch
 
-from nanochat.common import get_base_dir
+from nanochat.artifacts import get_checkpoints_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
@@ -19,24 +19,62 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
+# Config keys that did not exist in older checkpoints, with the value that reproduces the
+# behavior those checkpoints were trained with.
+_CONFIG_KEY_DEFAULTS = {
+    "window_pattern": "L",      # old models were trained with full context (no sliding window)
+    "laplacian_heads": 0,       # old models had no Laplacian heads
+    "use_ve": True,             # every ablation switch was implicitly on
+    "use_resid_lambdas": True,
+    "use_x0": True,
+    "use_smear": True,
+    "use_backout": True,
+}
+
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
-    # Old models were trained with full context (no sliding window)
-    if "window_pattern" not in model_config_kwargs:
-        model_config_kwargs["window_pattern"] = "L"
-        log0(f"Patching missing window_pattern in model config to 'L'")
+    for key, default in _CONFIG_KEY_DEFAULTS.items():
+        if key not in model_config_kwargs:
+            model_config_kwargs[key] = default
+            log0(f"Patching missing {key} in model config to {default!r}")
+
+def _make_like_param(model_data, shape, fill_value):
+    """Build a default tensor for a missing scalar parameter.
+
+    Device is taken from the checkpoint's other tensors (load_state_dict runs with assign=True,
+    so a CPU tensor here would end up inside a CUDA model). dtype is pinned to fp32 because
+    that is what these parameters are on the model - only wte and value_embeds get cast to
+    COMPUTE_DTYPE, so copying dtype from a sample tensor would silently downcast them to bf16.
+    """
+    sample = next((t for t in model_data.values() if torch.is_tensor(t) and t.is_floating_point()), None)
+    device = None if sample is None else sample.device
+    return torch.full(shape, fill_value, dtype=torch.float32, device=device)
 
 def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
+    """Reconcile a checkpoint's parameters with the components the config actually enables.
+
+    Disabled components are None on the model and therefore absent from its state_dict, while
+    build_model loads with strict=True. So this has to work in both directions: synthesize
+    defaults for enabled components an older checkpoint lacks, and drop parameters belonging
+    to components this config disables.
+    """
     n_layer = model_config.n_layer
-    # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
-    # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
+    # (state_dict key, enabled, shape, default fill value)
+    expected = [
+        ("resid_lambdas", model_config.use_resid_lambdas, (n_layer,), 1.0),  # 1.0 = identity scaling
+        ("x0_lambdas", model_config.use_x0, (n_layer,), 0.0),                # 0.0 = disabled
+        ("smear_lambda", model_config.use_smear, (1,), 0.0),
+        ("smear_gate.weight", model_config.use_smear, (1, 24), 0.0),
+        ("backout_lambda", model_config.use_backout, (1,), 0.2),
+    ]
+    for key, enabled, shape, fill_value in expected:
+        if not enabled:
+            if key in model_data:
+                model_data.pop(key)
+                log0(f"Dropping {key} from model data because it is disabled in the model config")
+        elif key not in model_data:
+            model_data[key] = _make_like_param(model_data, shape, fill_value)
+            log0(f"Patching missing {key} in model data to {fill_value}")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -91,10 +129,13 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = meta_data["model_config"]
+    model_config_kwargs = dict(meta_data["model_config"]) # copy so patching doesn't mutate the caller's meta
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
+    # Hand back the normalized config, and a model tag for callers that need to name outputs
+    meta_data["model_config"] = model_config.to_dict()
+    meta_data.setdefault("model_tag", os.path.basename(checkpoint_dir))
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
@@ -120,15 +161,19 @@ def find_largest_model(checkpoints_dir):
     if not model_tags:
         raise FileNotFoundError(f"No checkpoints found in {checkpoints_dir}")
     # 1) normally all model tags are of the form d<number>, try that first:
+    # Many tags now share a depth prefix (d20-e1280-...-lap0-s1, d20-e1280-...-lap2-s1, ...),
+    # so break ties on mtime and take the most recently trained. Note this makes auto-selection
+    # mtime-dependent: pass an explicit model_tag whenever the choice matters.
     candidates = []
     for model_tag in model_tags:
         match = re.match(r"d(\d+)", model_tag)
         if match:
             model_depth = int(match.group(1))
-            candidates.append((model_depth, model_tag))
+            model_mtime = os.path.getmtime(os.path.join(checkpoints_dir, model_tag))
+            candidates.append((model_depth, model_mtime, model_tag))
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        candidates.sort(reverse=True)
+        return candidates[0][2]
     # 2) if that failed, take the most recently updated model:
     model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
     return model_tags[0]
@@ -158,27 +203,16 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    meta_data["model_tag"] = model_tag # the tag we actually resolved to, for naming derived artifacts
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    checkpoints_dir = get_checkpoints_dir(source)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
 
 def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    checkpoints_dir = get_checkpoints_dir(source)
     if model_tag is None:
         model_tag = find_largest_model(checkpoints_dir)
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)

@@ -22,6 +22,7 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
+from nanochat.artifacts import get_checkpoint_dir
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
@@ -34,9 +35,11 @@ parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="random seed: also mixed into the rollout sampling seeds")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--output-tag", type=str, default=None, help="model tag to save to (default: inherit the loaded model's tag)")
 # Training horizon
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
 # Batch sizes / sampling
@@ -63,7 +66,7 @@ user_config = vars(args).copy()
 
 # Init compute/precision
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 
 # wandb logging init
@@ -72,6 +75,12 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+source_model_tag = meta["model_tag"] # the tag actually resolved to (args.model_tag may be None)
+output_model_tag = args.output_tag if args.output_tag else source_model_tag
+user_config["source_model_tag"] = source_model_tag
+user_config["resolved_model_tag"] = output_model_tag
+print0(f"Loaded SFT model tag: {source_model_tag}")
+print0(f"Output model tag: {output_model_tag}")
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -102,7 +111,7 @@ def get_batch():
         masks = []
         num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
-            seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
+            seed = hash((args.seed, step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
             generated_token_sequences_batch, masks_batch = engine.generate_batch(
                 tokens,
                 num_samples=args.device_batch_size,
@@ -172,7 +181,10 @@ def run_gsm8k_eval(task, tokenizer, engine,
             num_samples=num_samples,
             max_tokens=max_completion_tokens,
             temperature=temperature,
-            top_k=top_k
+            top_k=top_k,
+            # Derive from the run seed rather than silently defaulting to 42.
+            # Ints only: hash() is randomized by PYTHONHASHSEED for strings, but not for ints.
+            seed=hash((args.seed, -1, idx)) & 0x7FFFFFFF,
         )
         # Check each sample for correctness
         outcomes = []
@@ -307,17 +319,18 @@ for step in range(num_steps):
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
-        depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        checkpoint_dir = get_checkpoint_dir("rl", output_model_tag, base_dir=base_dir)
         save_checkpoint(
             checkpoint_dir,
             step,
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
-                "model_config": model_config_kwargs,
+                # to_dict() rather than config.__dict__: the latter would serialize
+                # laplacian_heads as a tuple, which does not round-trip through JSON cleanly
+                "model_config": model.config.to_dict(),
+                "model_tag": output_model_tag,
+                "user_config": user_config,
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

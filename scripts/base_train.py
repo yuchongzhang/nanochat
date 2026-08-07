@@ -18,16 +18,16 @@ import json
 import time
 import math
 import argparse
-from dataclasses import asdict
 from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
+from nanochat.artifacts import parse_laplacian_heads_spec, resolve_model_tag, get_checkpoint_dir
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -43,6 +43,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="random seed: controls weight init and training shard order")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -52,6 +53,13 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--laplacian-heads", type=parse_laplacian_heads_spec, default=0, help="number of Laplacian attention heads: an int for all layers, or a comma-separated per-layer list (e.g. '0,2,2,0')")
+# Architecture ablations (each removes a component and its parameters entirely)
+parser.add_argument("--no-ve", action="store_true", help="disable value embeddings / value residual")
+parser.add_argument("--no-resid-lambdas", action="store_true", help="disable per-layer residual scaling (use standard residual connections)")
+parser.add_argument("--no-x0", action="store_true", help="disable per-layer re-injection of the initial embedding")
+parser.add_argument("--no-smear", action="store_true", help="disable the previous-token embedding smear")
+parser.add_argument("--no-backout", action="store_true", help="disable the mid-layer residual subtraction")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -83,7 +91,7 @@ user_config = vars(args).copy()  # for logging
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -126,17 +134,30 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_model_meta(depth, default_architecture=False):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data).
+
+    default_architecture=True ignores the architecture CLI flags and builds the stock model.
+    Used for the d12 scaling-law reference, which must not move when we ablate the target.
+    """
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    architecture = {} if default_architecture else dict(
+        laplacian_heads=args.laplacian_heads,
+        use_ve=not args.no_ve,
+        use_resid_lambdas=not args.no_resid_lambdas,
+        use_x0=not args.no_x0,
+        use_smear=not args.no_smear,
+        use_backout=not args.no_backout,
+    )
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        **architecture,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -145,19 +166,25 @@ def build_model_meta(depth):
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
-model_config_kwargs = asdict(model_config)
+model_config_kwargs = model_config.to_dict()
+resolved_model_tag = resolve_model_tag(model_config, args.seed, args.model_tag)
+user_config["resolved_model_tag"] = resolved_model_tag
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+print0(f"Resolved model tag: {resolved_model_tag}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+checkpoint_dir = get_checkpoint_dir("base", resolved_model_tag)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    # The dataloader's pq_idx indexes into a seed-permuted shard list, so resuming under a
+    # different seed would silently replay or skip data.
+    resume_seed = meta_data.get("user_config", {}).get("seed")
+    assert resume_seed is None or resume_seed == args.seed, \
+        f"Checkpoint was trained with --seed={resume_seed} but --seed={args.seed} was given; the data order would not line up"
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -269,7 +296,11 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+# It is built with the *default* architecture on purpose: D_REF must be a fixed constant, not something
+# that shifts whenever we ablate a component or turn on Laplacian heads in the model being trained.
+# (Passing the CLI architecture through here would also hard-crash on a per-layer laplacian list
+# whose length is n_layer != 12.)
+d12_ref = build_model_meta(12, default_architecture=True) # creates the model on meta device
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -328,8 +359,8 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, shard_seed=args.seed)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device) # val order is fixed across seeds
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -484,6 +515,7 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
+                "model_tag": resolved_model_tag,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,

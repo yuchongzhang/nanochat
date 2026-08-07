@@ -16,19 +16,26 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import random
+
 import torch
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, shard_seed=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    shard_seed (train split only) permutes the order of the training shards, so that runs with
+    different seeds see genuinely different data streams rather than the identical one. None
+    keeps the natural sorted order. The permutation must be reproducible to resume a run, since
+    pq_idx indexes into the permuted list.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
@@ -36,6 +43,9 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    if shard_seed is not None and split == "train":
+        # val deliberately keeps its fixed order so eval stays comparable across seeds
+        random.Random(shard_seed).shuffle(parquet_paths)
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
@@ -75,7 +85,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, shard_seed=None
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -96,7 +106,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, shard_seed=shard_seed)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
